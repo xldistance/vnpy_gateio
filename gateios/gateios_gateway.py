@@ -364,11 +364,7 @@ class GateiosRestApi(RestClient):
         """
         查询未成交委托单错误回调
         """
-        # 过滤系统错误
-        error = request.response.json().get("label",None)
-        if error == "SERVER_ERROR":
-            return
-        self.gateway.write_log(f"错误代码：{status_code}，错误请求：{request.path}，完整请求：{request}")
+        self.gateway.write_log(f"错误代码：{status_code}，错误请求：{request.path}，错误信息：{request.response.json()}")
     #-------------------------------------------------------------------------------------------------
     def send_order(self, req: OrderRequest):
         """
