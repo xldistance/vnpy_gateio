@@ -12,7 +12,7 @@ from peewee import chunked
 from pathlib import Path
 
 from vnpy.trader.database import database_manager
-from vnpy.trader.utility import (save_connection_status,delete_dr_data,get_folder_path,load_json, save_json,remain_digit,get_symbol_mark,get_local_datetime,extract_vt_symbol,TZ_INFO,publish_redis_data,GetFilePath)
+from vnpy.trader.utility import (save_connection_status,delete_dr_data,get_folder_path,load_json, save_json,remain_digit,get_symbol_mark,get_local_datetime,extract_vt_symbol,TZ_INFO,GetFilePath)
 from vnpy.trader.setting import gateio_account
 from vnpy.api.rest import Request, RestClient
 from vnpy.api.websocket import WebsocketClient
@@ -72,8 +72,8 @@ class GateioUsdtGateway(BaseGateway):
         super().__init__(event_engine, "GATEIOUSDT")
         self.order_manager = LocalOrderManager(self)
 
-        self.ws_api:GateiosWebsocketApi = GateiosWebsocketApi(self)
-        self.rest_api:GateiosRestApi = GateiosRestApi(self)
+        self.ws_api:GateioUsdtWebsocketApi = GateioUsdtWebsocketApi(self)
+        self.rest_api:GateioUsdtRestApi = GateioUsdtRestApi(self)
         self.query_count = 0
         self.recording_list = [vt_symbol for vt_symbol in self.recording_list if extract_vt_symbol(vt_symbol)[2] == self.gateway_name  and not extract_vt_symbol(vt_symbol)[0].endswith("99")]
         #历史数据合约列表
@@ -127,6 +127,9 @@ class GateioUsdtGateway(BaseGateway):
         """
         查询合约历史数据
         """
+        # 等待restapi合约数据推送完成后再查询历史数据
+        if not self.rest_api.contract_inited:
+            return
         if len(self.history_contracts) > 0:
             symbol,exchange,gateway_name = extract_vt_symbol(self.history_contracts.pop(0))
             req = HistoryRequest(
@@ -134,6 +137,7 @@ class GateioUsdtGateway(BaseGateway):
                 exchange = Exchange(exchange),
                 interval = Interval.MINUTE,
                 start = datetime.now(TZ_INFO) - timedelta(days = 1),
+                end= datetime.now(TZ_INFO),
                 gateway_name = self.gateway_name
             )
             self.rest_api.query_history(req)
@@ -165,7 +169,7 @@ class GateioUsdtGateway(BaseGateway):
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
         self.event_engine.register(EVENT_TIMER, self.query_history)
 #-------------------------------------------------------------------------------------------------
-class GateiosRestApi(RestClient):
+class GateioUsdtRestApi(RestClient):
     """
     Gateios REST API
     """
@@ -189,6 +193,7 @@ class GateiosRestApi(RestClient):
 
         self.account_date = None    #账户日期
         self.accounts_info:Dict[str,dict] = {}
+        self.contract_inited:bool = False
     #-------------------------------------------------------------------------------------------------
     def sign(self, request):
         """
@@ -304,44 +309,57 @@ class GateiosRestApi(RestClient):
         history = []
         interval = INTERVAL_VT2GATEIO[req.interval]
         time_consuming_start = time()
-        params = {
-            "contract": req.symbol,
-            "limit": 2000,
-            "interval": interval,
-        }
-
-        resp = self.request(
-            method="GET",
-            path="/api/v4/futures/usdt/candlesticks",
-            params=params
-        )
-
-        if resp.status_code // 100 != 2:
-            msg = f"标的：{req.vt_symbol}获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
-            self.gateway.write_log(msg)
-        else:
-            data = resp.json()
-            if not data:
-                msg = f"标的：{req.vt_symbol}获取历史数据为空"
+        end_time = req.end
+        while True:
+            params = {
+                "contract": req.symbol,
+                "to":int(end_time.timestamp()),
+                "interval": interval,
+            }
+            resp = self.request(
+                method="GET",
+                path="/api/v4/futures/usdt/candlesticks",
+                params=params
+            )
+            if resp.status_code // 100 != 2:
+                msg = f"标的：{req.vt_symbol}获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
                 self.gateway.write_log(msg)
-            for raw in data:
-                bar = BarData(
-                    symbol=req.symbol,
-                    exchange=req.exchange,
-                    datetime=get_local_datetime(raw["t"]),
-                    interval=req.interval,
-                    volume=raw["v"],
-                    open_price=float(raw["o"]),
-                    high_price=float(raw["h"]),
-                    low_price=float(raw["l"]),
-                    close_price=float(raw["c"]),
-                    gateway_name=self.gateway_name
-                )
-                history.append(bar)
-
+                break
+            else:
+                data = resp.json()
+                if not data:
+                    msg = f"标的：{req.vt_symbol}获取历史数据为空"
+                    self.gateway.write_log(msg)
+                    break
+                buf = []
+                for raw in data:
+                    bar = BarData(
+                        symbol=req.symbol,
+                        exchange=req.exchange,
+                        datetime=get_local_datetime(raw["t"]),
+                        interval=req.interval,
+                        volume=raw["v"],
+                        open_price=float(raw["o"]),
+                        high_price=float(raw["h"]),
+                        low_price=float(raw["l"]),
+                        close_price=float(raw["c"]),
+                        gateway_name=self.gateway_name
+                    )
+                    buf.append(bar)
+                end_time = bar.datetime - timedelta(minutes= 100)
+                history.extend(buf)
+                # 按照请求时间结束数据下载
+                #if end_time <= req.start:
+                    #break
+                # 下载100根bar结束数据下载
+                if len(history) >= 100:
+                    break
         if not history:
-            self.gateway.write_log(f"标的：{req.vt_symbol}获取历史数据为空")
+            msg = f"未获取到合约：{req.vt_symbol}历史数据"
+            self.gateway.write_log(msg)
             return
+        # 按照时间顺序前后排序bar
+        history = sorted(history, key=lambda x: x.datetime)
         for bar_data in chunked(history, 10000):               #分批保存数据
             try:
                 database_manager.save_bar_data(bar_data,False)      #保存数据到数据库  
@@ -351,13 +369,17 @@ class GateiosRestApi(RestClient):
         time_consuming_end =time()        
         query_time = round(time_consuming_end - time_consuming_start,3)
         msg = f"载入{req.vt_symbol}:bar数据，开始时间：{history[0].datetime} ，结束时间： {history[-1].datetime}，数据量：{len(history)}，耗时:{query_time}秒"
-        self.gateway.write_log(msg)   
+        self.gateway.write_log(msg)
     #------------------------------------------------------------------------------------------------- 
     def query_order_failed(self, status_code: int, request: Request) -> None:
         """
         查询未成交委托单错误回调
         """
-        self.gateway.write_log(f"错误代码：{status_code}，错误请求：{request.path}，错误信息：{request.response.json()}")
+        # 过滤系统错误
+        error = request.response.json().get("label",None)
+        if error == "SERVER_ERROR":
+            return
+        self.gateway.write_log(f"错误代码：{status_code}，错误请求：{request.path}，完整请求：{request}")
     #-------------------------------------------------------------------------------------------------
     def send_order(self, req: OrderRequest):
         """
@@ -430,15 +452,6 @@ class GateiosRestApi(RestClient):
         # 用accounts_info过滤只查询一次合约信息
         if not self.accounts_info:
             self.query_contract()
-            # 等待rest api获取到account_id再连接websocket api,ws_api.connect必须放到只执行一次的函数里面
-            self.ws_api.connect(
-                self.key,
-                self.secret,
-                self.server,
-                self.proxy_host,
-                self.proxy_port,
-                self.account_id,
-            )
 
         if account.balance:
             self.gateway.on_account(account)
@@ -537,13 +550,24 @@ class GateiosRestApi(RestClient):
                 exchange=Exchange.GATEIO,
                 name=symbol,
                 price_tick=float(raw["order_price_round"]),
-                size=int(raw["leverage_max"]),
+                size=float(raw["quanto_multiplier"]), # 合约面值，即1张合约对应多少标的币种
                 min_volume=raw["order_size_min"],
+                max_volume= raw["order_size_max"],
                 product=Product.FUTURES,
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_contract(contract)
         self.gateway.write_log(f"交易接口：{self.gateway_name} 合约信息查询成功")
+        self.contract_inited = True
+        # 等待rest api获取到account_id再连接websocket api
+        self.ws_api.connect(
+            self.key,
+            self.secret,
+            self.server,
+            self.proxy_host,
+            self.proxy_port,
+            self.account_id,
+        )
     #-------------------------------------------------------------------------------------------------
     def on_send_order(self, data, request):
         """
@@ -593,14 +617,14 @@ class GateiosRestApi(RestClient):
         self.gateway.write_log(msg)
 
 #-------------------------------------------------------------------------------------------------
-class GateiosWebsocketApi(WebsocketClient):
+class GateioUsdtWebsocketApi(WebsocketClient):
     """
     """
 
-    def __init__(self, gateway):
+    def __init__(self, gateway:GateioUsdtGateway):
         """
         """
-        super(GateiosWebsocketApi, self).__init__()
+        super(GateioUsdtWebsocketApi, self).__init__()
 
         self.gateway = gateway
         self.gateway_name = gateway.gateway_name
@@ -648,11 +672,9 @@ class GateiosWebsocketApi(WebsocketClient):
         """
         订阅tick数据
         """
-        while True:
-            if not self.account_id:
-                sleep(1)
-            else:
-                break
+        while not self.account_id:
+            self.gateway.rest_api.query_account()
+            sleep(1)
         # 订阅symbol主题
         topic = [
                 "futures.usertrades",
@@ -918,10 +940,10 @@ def get_hashed_data(get_data):
 
     return hashed_data.hexdigest()
 #-------------------------------------------------------------------------------------------------
-def generate_websocket_sign(secret, channel, event, time):
+def generate_websocket_sign(secret:str, channel:str, event:str, time:int):
     """
     """
-    message = 'channel=%s&event=%s&time=%s' % (channel, event, time)
+    message ="channel={}&event={}&time={}".format(channel, event, time)
 
     signature = hmac.new(
         secret.encode("utf-8"),
