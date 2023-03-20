@@ -673,7 +673,9 @@ class GateioUsdtWebsocketApi(WebsocketClient):
         订阅tick数据
         """
         while not self.account_id:
-            self.gateway.rest_api.query_account()
+            rest_api = self.gateway.rest_api
+            rest_api.query_account()
+            self.account_id = rest_api.account_id
             sleep(1)
         # 订阅symbol主题
         topic = [
