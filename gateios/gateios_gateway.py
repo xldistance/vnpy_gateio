@@ -749,7 +749,7 @@ class GateiosWebsocketApi(WebsocketClient):
     def on_packet(self, packet: Dict):
         """
         """
-        timestamp = packet["time"]
+        timestamp = packet["time_ms"]
         channel = packet["channel"]
         event = packet["event"]
         result = packet["result"]
