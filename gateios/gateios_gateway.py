@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 from typing import List, Dict
 from peewee import chunked
 from pathlib import Path
+from threading import Lock
+from collections import defaultdict
 
 from vnpy.trader.database import database_manager
 from vnpy.trader.utility import (save_connection_status,delete_dr_data,get_folder_path,load_json, save_json,remain_digit,get_symbol_mark,get_local_datetime,extract_vt_symbol,TZ_INFO,GetFilePath)
@@ -52,7 +54,8 @@ OPPOSITE_DIRECTION = {
 #-------------------------------------------------------------------------------------------------
 class GateiosGateway(BaseGateway):
     """
-    Gateio币本位永续合约
+    * Gateio币本位永续合约
+    * 仅支持单向持仓模式,下单合约数量张数(int)
     """
 
     default_setting = {
@@ -70,8 +73,6 @@ class GateiosGateway(BaseGateway):
         """
         """
         super().__init__(event_engine, "GATEIOS")
-        self.order_manager = LocalOrderManager(self)
-
         self.ws_api:GateiosWebsocketApi = GateiosWebsocketApi(self)
         self.rest_api:GateiosRestApi = GateiosRestApi(self)
         self.query_count = 0
@@ -183,7 +184,6 @@ class GateiosRestApi(RestClient):
 
         self.gateway = gateway
         self.gateway_name = gateway.gateway_name
-        self.order_manager = gateway.order_manager
         self.ws_api = gateway.ws_api
 
         self.key = ""
@@ -192,6 +192,13 @@ class GateiosRestApi(RestClient):
         self.server = ""
         self.proxy_host = ""
         self.proxy_port = 0
+
+        # 生成委托单号加线程锁
+        self.order_count: int = 0
+        self.order_count_lock: Lock = Lock()
+        self.connect_time: int = 0
+        # 用户自定义委托单id和交易所委托单id映射
+        self.orderid_map: Dict[str, str] = defaultdict(str)
 
         self.account_date = None    #账户日期
         self.accounts_info:Dict[str,dict] = {}
@@ -231,7 +238,9 @@ class GateiosRestApi(RestClient):
         self.server = server
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
-
+        self.connect_time = (
+            int(datetime.now().strftime("%y%m%d%H%M%S"))
+        )
         if server == "REAL":
             self.init(REST_HOST, proxy_host, proxy_port,gateway_name = self.gateway_name)
         else:
@@ -383,13 +392,23 @@ class GateiosRestApi(RestClient):
         if error == "SERVER_ERROR":
             return
         self.gateway.write_log(f"错误代码：{status_code}，错误请求：{request.path}，完整请求：{request}")
+    #------------------------------------------------------------------------------------------------- 
+    def _new_order_id(self) -> int:
+        """
+        生成本地委托号
+        """
+        with self.order_count_lock:
+            self.order_count += 1
+            return self.order_count
     #-------------------------------------------------------------------------------------------------
     def send_order(self, req: OrderRequest):
         """
         """
-        local_orderid = self.order_manager.new_local_orderid()
+        # 生成本地委托号
+        orderid: str = req.symbol + "-" +str(self.connect_time + self._new_order_id())
+
         order = req.create_order_data(
-            local_orderid,
+            orderid,
             self.gateway_name
         )
         order.datetime = datetime.now(TZ_INFO)
@@ -404,7 +423,7 @@ class GateiosRestApi(RestClient):
             "size": volume,
             "price": str(req.price),
             "tif": "gtc",
-            "text": f"t-{local_orderid}"
+            "text": f"t-{orderid}"
         }
         if req.offset == Offset.CLOSE:
             request_body["reduce_only"] = True
@@ -420,20 +439,23 @@ class GateiosRestApi(RestClient):
             on_error=self.on_send_order_error,
             on_failed=self.on_send_order_failed
         )
-        self.order_manager.on_order(order)
+        self.gateway.on_order(order)
         return order.vt_orderid
     #-------------------------------------------------------------------------------------------------
     def cancel_order(self, req: CancelRequest):
         """
         """
-        sys_orderid = self.order_manager.get_sys_orderid(req.orderid)
-        if not sys_orderid:
-            self.write_log("撤单失败，找不到对应系统委托号{}".format(req.orderid))
-            return
+        gateway_id = self.orderid_map[req.orderid]
+        if not gateway_id:
+            if self.orderid_map:
+                local_id = list(self.orderid_map)[0]
+                gateway_id = self.orderid_map[local_id]
+                self.orderid_map.pop(local_id)
+                self.gateway.write_log(f"合约：{req.vt_symbol}未获取到委托单id映射：自定义委托单id：{req.orderid}，使用交易所orderid：{gateway_id}撤单")
 
         self.add_request(
             method="DELETE",
-            path=f"/api/v4/futures/btc/orders/{sys_orderid}",
+            path=f"/api/v4/futures/btc/orders/{gateway_id}",
             callback=self.on_cancel_order,
             on_failed=self.on_cancel_order_failed,
             extra=req
@@ -466,19 +488,20 @@ class GateiosRestApi(RestClient):
             return
         accounts_info = list(self.accounts_info.values())
         account_date = accounts_info[-1]["datetime"].date()
-        account_path = GetFilePath().ctp_account_path.replace("ctp_account_1",self.gateway.account_file_name)
-        for account_data in accounts_info:
-            if not Path(account_path).exists(): # 如果文件不存在，需要写header
-                with open(account_path, 'w',newline="") as f1:          #newline=""不自动换行
-                    w1 = csv.DictWriter(f1, account_data.keys())
-                    w1.writeheader()
-                    w1.writerow(account_data)
-            else: # 文件存在，不需要写header
-                if self.account_date and self.account_date != account_date:        #一天写入一次账户信息         
-                    with open(account_path,'a',newline="") as f1:                               #a二进制追加形式写入
-                        w1 = csv.DictWriter(f1, account_data.keys())
-                        w1.writerow(account_data)
+        account_path = GetFilePath.ctp_account_path.replace("ctp_account_1",self.gateway.account_file_name)
+        write_header = not Path(account_path).exists()
+        additional_writing = self.account_date and self.account_date != account_date
         self.account_date = account_date
+        # 文件不存在则写入文件头，否则只在日期变更后追加写入文件
+        if not write_header and not additional_writing:
+            return
+        write_mode = "w" if write_header else "a"
+        for account_data in accounts_info:
+            with open(account_path, write_mode, newline="") as f1:          
+                w1 = csv.DictWriter(f1, list(account_data))
+                if write_header:
+                    w1.writeheader()
+                w1.writerow(account_data)
     #-------------------------------------------------------------------------------------------------
     def on_query_position(self, data, request):
         """
@@ -516,11 +539,9 @@ class GateiosRestApi(RestClient):
         """
         for raw in data:
             local_orderid = str(raw["text"])[2:]
-            sys_orderid = str(raw["id"])
-            self.order_manager.update_orderid_map(
-                local_orderid=local_orderid,
-                sys_orderid=sys_orderid
-            )
+            gateway_orderid = str(raw["id"])
+            self.orderid_map[local_orderid] = gateway_orderid
+
             volume = abs(raw["size"])
             traded = abs(raw["size"] - raw["left"])
             status = get_order_status(raw["status"], volume, traded)
@@ -542,7 +563,7 @@ class GateiosRestApi(RestClient):
             reduce_only = raw["is_reduce_only"]
             if reduce_only:
                 order.offset = Offset.CLOSE
-            self.order_manager.on_order(order)
+            self.gateway.on_order(order)
     #-------------------------------------------------------------------------------------------------
     def on_query_contract(self, data, request):
         """
@@ -579,10 +600,10 @@ class GateiosRestApi(RestClient):
         """
         """
         order = request.extra
-        sys_orderid = str(data["id"])
-        self.order_manager.update_orderid_map(order.orderid, sys_orderid)
+        gateway_orderid = str(data["id"])
+        self.orderid_map[order.orderid] = gateway_orderid
     #-------------------------------------------------------------------------------------------------
-    def on_send_order_failed(self, status_code: str, request: Request):
+    def on_send_order_failed(self, status_code: int, request: Request):
         """
         Callback when sending order failed on server.
         """
@@ -634,7 +655,6 @@ class GateiosWebsocketApi(WebsocketClient):
 
         self.gateway = gateway
         self.gateway_name = gateway.gateway_name
-        self.order_manager = gateway.order_manager
 
         self.key = ""
         self.secret = ""
@@ -740,13 +760,13 @@ class GateiosWebsocketApi(WebsocketClient):
         if channel == "futures.tickers" and event == "update":
             self.on_tick(result, timestamp)
         elif channel == "futures.order_book" and event == "all":
-            self.on_depth(result, timestamp)
+            self.on_depth(result)
         elif channel == "futures.orders" and event == "update":
-            self.on_order(result, timestamp)
+            self.on_order(result)
         elif channel == "futures.usertrades" and event == "update":
-            self.on_trade(result, timestamp)
+            self.on_trade(result)
         elif channel == "futures.positions" and event == "update":
-            self.on_position(result, timestamp)
+            self.on_position(result)
     #-------------------------------------------------------------------------------------------------
     def on_error(self, exception_type: type, exception_value: Exception, tb):
         """
@@ -782,21 +802,24 @@ class GateiosWebsocketApi(WebsocketClient):
         """
         收到tick回报
         """
-        data = raw[0]
-        symbol = data["contract"]
-        tick = self.ticks.get(symbol, None)
-        if not tick:
-            return
-        tick.last_price = float(data["last"])
-        tick.volume = int(data["volume_24h"])
-        tick.datetime = get_local_datetime(timestamp)
-        if tick.last_price:
-            self.gateway.on_tick(copy(tick))
+        for data in raw:
+            symbol = data["contract"]
+            tick = self.ticks.get(symbol, None)
+            if not tick:
+                return
+            tick.high_price = float(data["high_24h"])
+            tick.low_price = float(data["low_24h"])
+            tick.last_price = float(data["last"])
+            tick.volume = int(data["volume_24h"])
+            tick.datetime = get_local_datetime(timestamp)
+            if tick.last_price:
+                self.gateway.on_tick(copy(tick))
     #-------------------------------------------------------------------------------------------------
-    def on_depth(self, raw: Dict, timestamp: int):
+    def on_depth(self, raw: Dict):
         """
         收到tick深度回报
         """
+        timestamp = raw["t"]
         symbol = raw["contract"]
         tick = self.ticks.get(symbol, None)
         if not tick:
@@ -817,66 +840,73 @@ class GateiosWebsocketApi(WebsocketClient):
         if tick.last_price:
             self.gateway.on_tick(copy(tick))
     #-------------------------------------------------------------------------------------------------
-    def on_order(self, raw: List, timestamp: int):
+    def on_order(self, raw: List):
         """
         收到委托单回报
         """
-        data = raw[0]
-        local_orderid = str(data["text"])[2:]
+        for data in raw:
+            local_orderid = str(data["text"])[2:]
 
-        if data["size"] > 0:
-            direction = Direction.LONG
-        else:
-            direction = Direction.SHORT
+            if data["size"] > 0:
+                direction = Direction.LONG
+            else:
+                direction = Direction.SHORT
 
-        volume = abs(data["size"])
-        traded = abs(data["size"] - data["left"])
-        status = get_order_status(data["status"], volume, traded)
-        reduce_only = data["is_reduce_only"]
-        order = OrderData(
-            orderid=local_orderid,
-            symbol=data["contract"],
-            exchange=Exchange.GATEIO,
-            price=float(data["price"]),
-            volume=volume,
-            traded = traded,
-            type=OrderType.LIMIT,
-            direction=direction,
-            status=status,
-            datetime=get_local_datetime(timestamp),
-            gateway_name=self.gateway_name,
-        )
-        if reduce_only:
-            order.offset = Offset.CLOSE
-        self.order_manager.on_order(order)
+            volume = abs(data["size"])
+            traded = abs(data["size"] - data["left"])
+            status = get_order_status(data["status"], volume, traded)
+            reduce_only = data["is_reduce_only"]
+            order = OrderData(
+                orderid=local_orderid,
+                symbol=data["contract"],
+                exchange=Exchange.GATEIO,
+                price=float(data["price"]),
+                volume=volume,
+                traded = traded,
+                type=OrderType.LIMIT,
+                direction=direction,
+                status=status,
+                datetime=get_local_datetime(data["create_time_ms"]),
+                gateway_name=self.gateway_name,
+            )
+            if reduce_only:
+                order.offset = Offset.CLOSE
+            orderid_map = self.gateway.rest_api.orderid_map
+            if not order.is_active():
+                if local_orderid in orderid_map:
+                    orderid_map.pop(local_orderid)
+            else:
+                orderid_map[local_orderid] = str(data["id"])
+
+            self.gateway.on_order(order)
     #-------------------------------------------------------------------------------------------------
-    def on_trade(self, raw: List, timestamp: int):
+    def on_trade(self, raw: List):
         """
         收到成交回报
         """
-        data = raw[0]
-
-        sys_orderid = data["order_id"]
-        order = self.order_manager.get_order_with_sys_orderid(sys_orderid)
-        if not order:
-            return
-        trade = TradeData(
-            symbol=order.symbol,
-            exchange=order.exchange,
-            orderid=order.orderid,
-            tradeid=data["id"],
-            direction=order.direction,
-            offset = order.offset,
-            price=float(data["price"]),
-            volume=abs(data["size"]),
-            datetime=get_local_datetime(data["create_time"]),
-            gateway_name=self.gateway_name,
-        )
-        self.gateway.on_trade(trade)
+        for data in raw:
+            volume = float(data["size"])
+            if volume > 0:
+                direction = Direction.LONG
+            else:
+                direction = Direction.SHORT
+            trade = TradeData(
+                symbol=data["contract"],
+                exchange=Exchange.GATEIO,
+                orderid=data["text"][2:],
+                tradeid=data["id"],
+                direction=direction,
+                price=float(data["price"]),
+                volume=abs(data["size"]),
+                datetime=get_local_datetime(data["create_time_ms"]),
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_trade(trade)
     #-------------------------------------------------------------------------------------------------
-    def on_position(self,raw:List, timestamp:int):
+    def on_position(self,raw:List):
         """
-        收到持仓回报
+        * 收到持仓回报
+        * websocket没有未结持仓盈亏参数
         """
         for data in raw:
             volume = float(data["size"])
