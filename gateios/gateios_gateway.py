@@ -545,7 +545,7 @@ class GateiosRestApi(RestClient):
             volume = abs(raw["size"])
             traded = abs(raw["size"] - raw["left"])
             status = get_order_status(raw["status"], volume, traded)
-            if volume > 0:
+            if raw["size"] > 0:
                 direction = Direction.LONG
             else:
                 direction = Direction.SHORT
@@ -757,15 +757,17 @@ class GateiosWebsocketApi(WebsocketClient):
         if error:
             self.gateway.write_log(f"交易接口：{self.gateway_name} Websocket API报错：{error}")
             return
-        if channel == "futures.tickers" and event == "update":
+        if event == "subscribe":
+            return
+        if channel == "futures.tickers":
             self.on_tick(result, timestamp)
-        elif channel == "futures.order_book" and event == "all":
+        elif channel == "futures.order_book":
             self.on_depth(result)
-        elif channel == "futures.orders" and event == "update":
+        elif channel == "futures.orders":
             self.on_order(result)
-        elif channel == "futures.usertrades" and event == "update":
+        elif channel == "futures.usertrades":
             self.on_trade(result)
-        elif channel == "futures.positions" and event == "update":
+        elif channel == "futures.positions":
             self.on_position(result)
     #-------------------------------------------------------------------------------------------------
     def on_error(self, exception_type: type, exception_value: Exception, tb):
