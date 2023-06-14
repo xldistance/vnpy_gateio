@@ -554,7 +554,7 @@ class GateiosRestApi(RestClient):
                 symbol=raw["contract"],
                 exchange=Exchange.GATEIO,
                 price=float(raw["price"]),
-                volume=abs(volume),
+                volume=volume,
                 direction=direction,
                 status=status,
                 datetime=get_local_datetime(raw["create_time"]),
