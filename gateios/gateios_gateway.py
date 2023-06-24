@@ -203,6 +203,7 @@ class GateiosRestApi(RestClient):
         self.account_date = None    #账户日期
         self.accounts_info:Dict[str,dict] = {}
         self.contract_inited:bool = False
+        self.position_pnl:Dict[str,float] = {}
     #-------------------------------------------------------------------------------------------------
     def sign(self, request):
         """
@@ -518,7 +519,7 @@ class GateiosRestApi(RestClient):
                 volume=abs(volume),
                 direction=direction,
                 price=float(raw["entry_price"]),
-                pnl=float(raw["realised_pnl"]),
+                pnl=float(raw["unrealised_pnl"]),
                 gateway_name=self.gateway_name,
             )
             pos_2 = PositionData(
@@ -531,6 +532,8 @@ class GateiosRestApi(RestClient):
                 pnl = 0,          #持仓盈亏
                 frozen= 0,        # 持仓冻结保证金
             )
+            pos_1_direction = pos_1.vt_symbol + pos_1.direction.value
+            self.position_pnl[pos_1_direction] = pos_1.pnl
             self.gateway.on_position(pos_1)
             self.gateway.on_position(pos_2)
     #-------------------------------------------------------------------------------------------------
@@ -910,6 +913,7 @@ class GateiosWebsocketApi(WebsocketClient):
         * 收到持仓回报
         * websocket没有未结持仓盈亏参数
         """
+        position_pnl = self.gateway.rest_api.position_pnl
         for data in raw:
             volume = float(data["size"])
             if volume >= 0:
@@ -922,9 +926,11 @@ class GateiosWebsocketApi(WebsocketClient):
                 volume=abs(volume),
                 direction=direction,
                 price=float(data["entry_price"]),
-                pnl=float(data["realised_pnl"]),
                 gateway_name=self.gateway_name,
             )
+            pos_1_direction = pos_1.vt_symbol + pos_1.direction.value
+            pos_1.pnl = position_pnl.get(pos_1_direction,0)
+
             pos_2 = PositionData(
                 symbol=data["contract"],
                 exchange=Exchange.GATEIO,
