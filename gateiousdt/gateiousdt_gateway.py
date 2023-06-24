@@ -138,7 +138,7 @@ class GateioUsdtGateway(BaseGateway):
                 symbol = symbol,
                 exchange = Exchange(exchange),
                 interval = Interval.MINUTE,
-                start = datetime.now(TZ_INFO) - timedelta(days = 3),
+                start = datetime.now(TZ_INFO) - timedelta(days = 1),
                 end= datetime.now(TZ_INFO),
                 gateway_name = self.gateway_name
             )
