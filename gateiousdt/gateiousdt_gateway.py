@@ -138,7 +138,7 @@ class GateioUsdtGateway(BaseGateway):
                 symbol = symbol,
                 exchange = Exchange(exchange),
                 interval = Interval.MINUTE,
-                start = datetime.now(TZ_INFO) - timedelta(days = 1),
+                start = datetime.now(TZ_INFO) - timedelta(days = 3),
                 end= datetime.now(TZ_INFO),
                 gateway_name = self.gateway_name
             )
@@ -202,6 +202,8 @@ class GateioUsdtRestApi(RestClient):
         self.account_date = None    #账户日期
         self.accounts_info:Dict[str,dict] = {}
         self.contract_inited:bool = False
+
+        self.position_pnl:Dict[str,float] = {}
     #-------------------------------------------------------------------------------------------------
     def sign(self, request):
         """
@@ -514,7 +516,7 @@ class GateioUsdtRestApi(RestClient):
                 exchange=Exchange.GATEIO,
                 volume=abs(volume),
                 price=float(raw["entry_price"]),
-                pnl=float(raw["realised_pnl"]),
+                pnl=float(raw["unrealised_pnl"]),
                 direction=direction,
                 gateway_name=self.gateway_name,
             )
@@ -528,6 +530,8 @@ class GateioUsdtRestApi(RestClient):
                 pnl = 0,          #持仓盈亏
                 frozen= 0,        # 持仓冻结保证金
             )
+            pos_1_direction = pos_1.vt_symbol + pos_1.direction.value
+            self.position_pnl[pos_1_direction] = pos_1.pnl
             self.gateway.on_position(pos_1)
             self.gateway.on_position(pos_2)
     #-------------------------------------------------------------------------------------------------
@@ -903,6 +907,7 @@ class GateioUsdtWebsocketApi(WebsocketClient):
         * 收到持仓回报
         * websocket没有未结持仓盈亏参数
         """
+        position_pnl = self.gateway.rest_api.position_pnl
         for data in raw:
             volume = float(data["size"])
             if volume >= 0:
@@ -915,9 +920,11 @@ class GateioUsdtWebsocketApi(WebsocketClient):
                 volume=abs(volume),
                 direction=direction,
                 price=float(data["entry_price"]),
-                pnl=float(data["realised_pnl"]),
                 gateway_name=self.gateway_name,
             )
+            pos_1_direction = pos_1.vt_symbol + pos_1.direction.value
+            pos_1.pnl = position_pnl.get(pos_1_direction,0)
+
             pos_2 = PositionData(
                 symbol=data["contract"],
                 exchange=Exchange.GATEIO,
@@ -928,6 +935,7 @@ class GateioUsdtWebsocketApi(WebsocketClient):
                 pnl = 0,          #持仓盈亏
                 frozen= 0,        # 持仓冻结保证金
             )
+            
             self.gateway.on_position(pos_1)
             self.gateway.on_position(pos_2)
 #-------------------------------------------------------------------------------------------------
