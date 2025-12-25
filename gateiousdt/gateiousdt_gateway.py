@@ -732,7 +732,7 @@ class GateioUsdtWebsocketApi(WebsocketClient):
             tick.high_price = float(data["high_24h"])
             tick.low_price = float(data["low_24h"])
             tick.last_price = float(data["last"])
-            tick.volume = int(data["volume_24h_base"])     # 最近24小时币的成交量
+            tick.volume = float(data["volume_24h_base"])     # 最近24小时币的成交量
             tick.datetime = get_local_datetime(timestamp)
     # ----------------------------------------------------------------------------------------------------
     def on_depth(self, raw: Dict):
