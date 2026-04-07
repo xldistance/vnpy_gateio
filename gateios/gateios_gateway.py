@@ -714,7 +714,9 @@ class GateiosWebsocketApi(WebsocketClient):
         if channel == "futures.tickers":
             self.on_tick(result, timestamp)
         else:
-            self.topic_map[channel](result)
+            func = self.topic_map.get(channel)
+            if func:
+                func(result)
     # ----------------------------------------------------------------------------------------------------
     def on_error(self, exception_type: type, exception_value: Exception, tb):
         """ """
